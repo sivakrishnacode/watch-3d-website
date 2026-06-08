@@ -14,176 +14,143 @@ export default function ScrollyCanvas({ scrollProgress }: ScrollyCanvasProps) {
   const [isLoaded, setIsLoaded] = useState(false);
   const totalCount = 150;
 
+  // rAF refs — all mutable, never trigger re-render
   const rafIdRef = useRef<number | null>(null);
   const targetFrameRef = useRef<number>(0);
   const lastDrawnFrameRef = useRef<number>(-1);
 
-  // Prevent scroll during preloading
+  // ── 1. Lock scroll until every frame is in memory ──────────────────────────
   useEffect(() => {
-    if (!isLoaded) {
+    const lock = () => {
       document.body.style.overflow = "hidden";
       document.documentElement.style.overflow = "hidden";
-    } else {
-      document.body.style.overflow = "";
-      document.documentElement.style.overflow = "";
-    }
-    return () => {
+    };
+    const unlock = () => {
       document.body.style.overflow = "";
       document.documentElement.style.overflow = "";
     };
+    if (!isLoaded) lock(); else unlock();
+    return unlock;
   }, [isLoaded]);
 
-  // Preload all frames on mount
+  // ── 2. Preload all frames eagerly ───────────────────────────────────────────
   useEffect(() => {
     let loaded = 0;
-    const images: HTMLImageElement[] = [];
-
-    const getFrameUrl = (index: number) => {
-      const paddedIndex = String(index).padStart(3, "0");
-      return `/sequence/frame_${paddedIndex}_delay-0.066s.webp`;
-    };
+    const images: HTMLImageElement[] = new Array(totalCount);
 
     for (let i = 0; i < totalCount; i++) {
+      const paddedIndex = String(i).padStart(3, "0");
       const img = new Image();
-      img.src = getFrameUrl(i);
-      img.onload = () => {
+      img.src = `/sequence/frame_${paddedIndex}_delay-0.066s.webp`;
+
+      const done = () => {
         loaded++;
         setLoadedCount(loaded);
-        if (loaded === totalCount) {
-          setIsLoaded(true);
-        }
+        if (loaded === totalCount) setIsLoaded(true);
       };
+      img.onload = done;
       img.onerror = () => {
-        // Fallback or retry on error
-        console.error(`Failed to load frame ${i}`);
-        loaded++;
-        setLoadedCount(loaded);
-        if (loaded === totalCount) {
-          setIsLoaded(true);
-        }
+        console.error(`Frame ${i} failed to load`);
+        done();
       };
-      images.push(img);
+      images[i] = img;
     }
     imagesRef.current = images;
-  }, []);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Frame drawing function
-  const drawFrame = (index: number) => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    const img = imagesRef.current[index];
-    if (!canvas || !ctx || !img) return;
-
-    // Set canvas dimensions with device pixel ratio support for sharp rendering
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.getBoundingClientRect();
-    const nextWidth = Math.round(rect.width * dpr);
-    const nextHeight = Math.round(rect.height * dpr);
-
-    const sizeChanged = canvas.width !== nextWidth || canvas.height !== nextHeight;
-
-    if (!sizeChanged && index === lastDrawnFrameRef.current) {
-      return; // Skip redundant draw call
-    }
-
-    if (sizeChanged) {
-      canvas.width = nextWidth;
-      canvas.height = nextHeight;
-    }
-
-    // Apply scaling transform cleanly without accumulating scale on repeated draws
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-    const canvasWidth = rect.width;
-    const canvasHeight = rect.height;
-    const imgWidth = img.naturalWidth || img.width;
-    const imgHeight = img.naturalHeight || img.height;
-
-    // Object-fit: cover scaling logic
-    const scale = Math.max(canvasWidth / imgWidth, canvasHeight / imgHeight);
-    const x = (canvasWidth - imgWidth * scale) / 2;
-    const y = (canvasHeight - imgHeight * scale) / 2;
-
-    ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-    ctx.drawImage(img, x, y, imgWidth * scale, imgHeight * scale);
-
-    lastDrawnFrameRef.current = index;
-  };
-
-  // Draw frame in requestAnimationFrame loop
-  const renderLoop = () => {
-    drawFrame(targetFrameRef.current);
-    rafIdRef.current = null;
-  };
-
-  // Redraw when loaded or when scrollProgress changes
+  // ── 3. rAF-gated rendering — one unified effect ────────────────────────────
   useEffect(() => {
     if (!isLoaded) return;
 
-    const handleScroll = (latest: number) => {
-      const frameIndex = Math.min(
-        totalCount - 1,
-        Math.max(0, Math.floor(latest * totalCount))
-      );
-      
-      targetFrameRef.current = frameIndex;
+    /** Draw a single frame onto the canvas with object-fit:cover semantics */
+    const drawFrame = (index: number) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      const ctx = canvas.getContext("2d");
+      const img = imagesRef.current[index];
+      if (!ctx || !img) return;
 
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      const nextW = Math.round(rect.width * dpr);
+      const nextH = Math.round(rect.height * dpr);
+      const sizeChanged = canvas.width !== nextW || canvas.height !== nextH;
+
+      // Nothing to do — same frame, same size
+      if (!sizeChanged && index === lastDrawnFrameRef.current) return;
+
+      if (sizeChanged) {
+        canvas.width = nextW;
+        canvas.height = nextH;
+      }
+
+      // setTransform avoids accumulating scale across repeated calls
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const cw = rect.width;
+      const ch = rect.height;
+      const iw = img.naturalWidth || img.width;
+      const ih = img.naturalHeight || img.height;
+
+      const scale = Math.max(cw / iw, ch / ih); // cover
+      const x = (cw - iw * scale) / 2;
+      const y = (ch - ih * scale) / 2;
+
+      ctx.clearRect(0, 0, cw, ch);
+      ctx.drawImage(img, x, y, iw * scale, ih * scale);
+      lastDrawnFrameRef.current = index;
+    };
+
+    /** Request a paint on the next animation frame (deduplicated) */
+    const scheduleFrame = (index: number) => {
+      targetFrameRef.current = index;
       if (rafIdRef.current === null) {
-        rafIdRef.current = requestAnimationFrame(renderLoop);
+        rafIdRef.current = requestAnimationFrame(() => {
+          drawFrame(targetFrameRef.current);
+          rafIdRef.current = null;
+        });
       }
     };
 
-    const unsubscribe = scrollProgress.on("change", handleScroll);
+    const handleScroll = (progress: number) => {
+      const idx = Math.min(totalCount - 1, Math.max(0, Math.floor(progress * totalCount)));
+      scheduleFrame(idx);
+    };
 
-    // Initial render
+    const handleResize = () => {
+      lastDrawnFrameRef.current = -1; // force redraw even if same frame index
+      handleScroll(scrollProgress.get());
+    };
+
+    // Wire up listeners
+    const unsubscribe = scrollProgress.on("change", handleScroll);
+    window.addEventListener("resize", handleResize, { passive: true });
+
+    // Paint first frame immediately after unlock
     handleScroll(scrollProgress.get());
 
     return () => {
       unsubscribe();
-      if (rafIdRef.current !== null) {
-        cancelAnimationFrame(rafIdRef.current);
-      }
-    };
-  }, [isLoaded, scrollProgress]);
-
-  // Handle canvas sizing and redraw on window resize
-  useEffect(() => {
-    if (!isLoaded) return;
-
-    const handleResize = () => {
-      const activeIndex = Math.min(
-        totalCount - 1,
-        Math.max(0, Math.floor(scrollProgress.get() * totalCount))
-      );
-      
-      targetFrameRef.current = activeIndex;
-
-      if (rafIdRef.current === null) {
-        rafIdRef.current = requestAnimationFrame(renderLoop);
-      }
-    };
-
-    window.addEventListener("resize", handleResize);
-    return () => {
       window.removeEventListener("resize", handleResize);
       if (rafIdRef.current !== null) {
         cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
       }
     };
-  }, [isLoaded, scrollProgress]);
+  }, [isLoaded, scrollProgress, totalCount]);
 
   const percentage = Math.round((loadedCount / totalCount) * 100);
 
   return (
     <div className="relative w-full h-full bg-[#020812]">
-      {/* Canvas */}
+      {/* Canvas — invisible until every frame is ready */}
       <canvas
         ref={canvasRef}
-        className="w-full h-full block object-cover transition-opacity duration-700 ease-in-out"
-        style={{ opacity: isLoaded ? 1 : 0 }}
+        className="w-full h-full block"
+        style={{ opacity: isLoaded ? 1 : 0, transition: "opacity 0.7s ease-in-out" }}
       />
 
-      {/* Luxury Brand Preloader Screen */}
+      {/* Luxury preloader — blocks interaction and hides canvas */}
       <AnimatePresence>
         {!isLoaded && (
           <motion.div
@@ -193,7 +160,6 @@ export default function ScrollyCanvas({ scrollProgress }: ScrollyCanvasProps) {
             className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-[#020812]"
           >
             <div className="flex flex-col items-center max-w-xs w-full px-6">
-              {/* Brand Title */}
               <motion.h1
                 initial={{ y: 20, opacity: 0 }}
                 animate={{ y: 0, opacity: 1 }}
@@ -203,9 +169,8 @@ export default function ScrollyCanvas({ scrollProgress }: ScrollyCanvasProps) {
                 VIRTUS
               </motion.h1>
 
-              {/* Progress Bar Container */}
+              {/* Animated progress bar */}
               <div className="w-full h-[2px] bg-white/5 relative overflow-hidden mb-4 rounded-full">
-                {/* Active progress bar */}
                 <motion.div
                   className="absolute left-0 top-0 bottom-0 bg-gradient-to-r from-electric-500 to-ice-400"
                   style={{ width: `${percentage}%` }}
@@ -213,14 +178,13 @@ export default function ScrollyCanvas({ scrollProgress }: ScrollyCanvasProps) {
                 />
               </div>
 
-              {/* Loader Status & Percentage */}
               <div className="w-full flex justify-between items-center text-[10px] tracking-[0.2em] uppercase text-silver-400 font-ui">
                 <span>SYSTEM PRELOAD</span>
                 <span className="font-semibold text-white">{percentage}%</span>
               </div>
             </div>
 
-            {/* Glowing background sweep */}
+            {/* Ambient blue glow */}
             <div className="absolute w-[300px] h-[300px] rounded-full bg-electric-500/10 blur-[100px] pointer-events-none" />
           </motion.div>
         )}
